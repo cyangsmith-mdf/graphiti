@@ -25,7 +25,7 @@ from openai.types.chat import ChatCompletionMessageParam
 from pydantic import BaseModel
 
 from ..prompts.models import Message
-from .client import LLMClient, get_extraction_language_instruction
+from .client import LLMClient, get_extraction_language_instruction, token_usage_context
 from .config import DEFAULT_MAX_TOKENS, LLMConfig, ModelSize
 from .errors import RateLimitError, RefusalError
 
@@ -135,10 +135,14 @@ class BaseOpenAIClient(LLMClient):
         response_model: type[BaseModel] | None = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         model_size: ModelSize = ModelSize.medium,
+        span: Any | None = None,
     ) -> dict[str, Any]:
         """Generate a response using the appropriate client implementation."""
         openai_messages = self._convert_messages_to_openai_format(messages)
         model = self._get_model_for_size(model_size)
+
+        if span:
+            span.add_attributes({'llm.model_name': model})
 
         try:
             if response_model:
@@ -151,6 +155,30 @@ class BaseOpenAIClient(LLMClient):
                     reasoning=self.reasoning,
                     verbosity=self.verbosity,
                 )
+                if span and hasattr(response, 'usage') and response.usage:
+                    try:
+                        # Try safe attribute access
+                        prompt_tokens = getattr(response.usage, 'input_tokens', 0)
+                        completion_tokens = getattr(response.usage, 'output_tokens', 0)
+                        total_tokens = getattr(response.usage, 'total_tokens', 0)
+
+                        span.add_attributes({
+                            'llm.token_count.prompt': prompt_tokens,
+                            'llm.token_count.completion': completion_tokens,
+                            'llm.token_count.total': total_tokens,
+                            'llm.provider': self._get_provider_type(),
+                            'llm.model_name': model,
+                        })
+
+                        # Update context for aggregation
+                        usage_ctx = token_usage_context.get()
+                        if usage_ctx is not None:
+                            usage_ctx['prompt_tokens'] = usage_ctx.get('input_tokens', 0) + prompt_tokens
+                            usage_ctx['completion_tokens'] = usage_ctx.get('output_tokens', 0) + completion_tokens
+                            usage_ctx['total_tokens'] = usage_ctx.get('total_tokens', 0) + total_tokens
+                    except Exception:
+                        pass  # Silently fail on telemetry if structure unexpected
+
                 return self._handle_structured_response(response)
             else:
                 response = await self._create_completion(
@@ -159,6 +187,30 @@ class BaseOpenAIClient(LLMClient):
                     temperature=self.temperature,
                     max_tokens=max_tokens or self.max_tokens,
                 )
+                if span and hasattr(response, 'usage') and response.usage:
+                    try:
+                        # Try safe attribute access
+                        prompt_tokens = getattr(response.usage, 'input_tokens', 0)
+                        completion_tokens = getattr(response.usage, 'output_tokens', 0)
+                        total_tokens = getattr(response.usage, 'total_tokens', 0)
+
+                        span.add_attributes({
+                            'llm.token_count.prompt': prompt_tokens,
+                            'llm.token_count.completion': completion_tokens,
+                            'llm.token_count.total': total_tokens,
+                            'llm.provider': self._get_provider_type(),
+                            'llm.model_name': model,
+                        })
+
+                        # Update context for aggregation
+                        usage_ctx = token_usage_context.get()
+                        if usage_ctx is not None:
+                            usage_ctx['prompt_tokens'] = usage_ctx.get('input_tokens', 0) + prompt_tokens
+                            usage_ctx['completion_tokens'] = usage_ctx.get('output_tokens', 0) + completion_tokens
+                            usage_ctx['total_tokens'] = usage_ctx.get('total_tokens', 0) + total_tokens
+                    except Exception:
+                        pass  # Silently fail on telemetry if structure unexpected
+
                 return self._handle_json_response(response)
 
         except openai.LengthFinishReasonError as e:
@@ -197,16 +249,32 @@ class BaseOpenAIClient(LLMClient):
         # Add multilingual extraction instructions
         messages[0].content += get_extraction_language_instruction(group_id)
 
+        model_name = self._get_model_for_size(model_size)
+
+        invocation_parameters: dict[str, typing.Any] = {
+            'temperature': self.temperature,
+            'max_tokens': max_tokens,
+            'model_size': model_size.value,
+            'model': model_name,
+            'reasoning': self.reasoning,
+            'verbosity': self.verbosity,
+        }
+        if response_model is not None:
+            invocation_parameters['response_model'] = response_model.__name__
+        if prompt_name:
+            invocation_parameters['prompt_name'] = prompt_name
+
         # Wrap entire operation in tracing span
-        with self.tracer.start_span('llm.generate') as span:
-            attributes = {
-                'llm.provider': 'openai',
-                'model.size': model_size.value,
-                'max_tokens': max_tokens,
-            }
-            if prompt_name:
-                attributes['prompt.name'] = prompt_name
-            span.add_attributes(attributes)
+        with self.tracer.start_span('llm') as span:
+            self._add_llm_input_attributes(
+                span,
+                messages=messages,
+                model_name=model_name,
+                model_size=model_size,
+                max_tokens=max_tokens,
+                prompt_name=prompt_name,
+                invocation_parameters=invocation_parameters,
+            )
 
             retry_count = 0
             last_error = None
@@ -214,8 +282,9 @@ class BaseOpenAIClient(LLMClient):
             while retry_count <= self.MAX_RETRIES:
                 try:
                     response = await self._generate_response(
-                        messages, response_model, max_tokens, model_size
+                        messages, response_model, max_tokens, model_size, span
                     )
+                    self._record_llm_output(span, response)
                     return response
                 except (RateLimitError, RefusalError):
                     # These errors should not trigger retries

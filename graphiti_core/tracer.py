@@ -148,7 +148,13 @@ class OpenTelemetryTracer(Tracer):
     def start_span(self, name: str) -> Generator[OpenTelemetrySpan | NoOpSpan, None, None]:
         """Start a new OpenTelemetry span with the configured prefix."""
         try:
-            full_name = f'{self._span_prefix}.{name}'
+            # Phoenix expects raw "llm" span names to remain un-prefixed for LLM traces.
+            if name == 'llm':
+                full_name = 'llm'
+            elif self._span_prefix:
+                full_name = f'{self._span_prefix}.{name}'
+            else:
+                full_name = name
             with self._tracer.start_as_current_span(full_name) as span:
                 yield OpenTelemetrySpan(span)
         except Exception:

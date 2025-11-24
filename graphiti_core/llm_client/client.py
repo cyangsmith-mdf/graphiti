@@ -19,6 +19,7 @@ import json
 import logging
 import typing
 from abc import ABC, abstractmethod
+from contextvars import ContextVar
 
 import httpx
 from diskcache import Cache
@@ -26,12 +27,15 @@ from pydantic import BaseModel
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_random_exponential
 
 from ..prompts.models import Message
-from ..tracer import NoOpTracer, Tracer
+from ..tracer import NoOpTracer, Tracer, TracerSpan
 from .config import DEFAULT_MAX_TOKENS, LLMConfig, ModelSize
 from .errors import RateLimitError
 
 DEFAULT_TEMPERATURE = 0
 DEFAULT_CACHE_DIR = './llm_cache'
+
+# Context variable to track token usage across a trace
+token_usage_context: ContextVar[dict[str, int] | None] = ContextVar('token_usage', default=None)
 
 
 def get_extraction_language_instruction(group_id: str | None = None) -> str:
@@ -146,6 +150,80 @@ class LLMClient(ABC):
         key_str = f'{self.model}:{message_str}'
         return hashlib.md5(key_str.encode()).hexdigest()
 
+    def _resolve_traced_model_name(self, model_size: ModelSize) -> str | None:
+        """Best-effort model name for telemetry."""
+        if model_size == ModelSize.small and self.small_model:
+            return self.small_model
+        return self.model
+
+    def _safe_json_dumps(self, payload: dict[str, typing.Any]) -> str:
+        """Serialize dictionaries for span attributes."""
+        return json.dumps(payload, default=str, sort_keys=True)
+
+    def _build_input_message_attributes(self, messages: list[Message]) -> dict[str, str]:
+        """Flatten prompt messages into OpenInference span attributes."""
+        attributes: dict[str, str] = {}
+        for idx, message in enumerate(messages):
+            base_key = f'llm.input_messages.{idx}.message'
+            attributes[f'{base_key}.role'] = message.role
+            attributes[f'{base_key}.content'] = message.content
+        return attributes
+
+    def _add_llm_input_attributes(
+        self,
+        span: TracerSpan,
+        *,
+        messages: list[Message],
+        model_name: str | None,
+        model_size: ModelSize,
+        max_tokens: int,
+        prompt_name: str | None,
+        invocation_parameters: dict[str, typing.Any] | None = None,
+        extra_attributes: dict[str, typing.Any] | None = None,
+    ) -> None:
+        """Attach OpenInference-compatible attributes for an LLM invocation."""
+        attributes: dict[str, typing.Any] = {
+            'openinference.span.kind': 'LLM',
+            'openinference.model.provider': self._get_provider_type(),
+            'llm.provider': self._get_provider_type(),
+            'model.size': model_size.value,
+            'max_tokens': max_tokens,
+            'cache.enabled': self.cache_enabled,
+        }
+        if model_name:
+            attributes['llm.model_name'] = model_name
+            attributes['openinference.model.name'] = model_name
+        if prompt_name:
+            attributes['prompt.name'] = prompt_name
+        if invocation_parameters:
+            # Remove None values for cleaner payloads
+            filtered_params = {k: v for k, v in invocation_parameters.items() if v is not None}
+            if filtered_params:
+                attributes['llm.invocation_parameters'] = self._safe_json_dumps(filtered_params)
+        attributes.update(self._build_input_message_attributes(messages))
+        if extra_attributes:
+            attributes.update(extra_attributes)
+        span.add_attributes(attributes)
+
+    def _record_llm_output(self, span: TracerSpan, output_payload: typing.Any) -> None:
+        """Attach assistant output to the tracing span."""
+        if output_payload is None:
+            return
+        if isinstance(output_payload, str):
+            serialized_output = output_payload
+        else:
+            try:
+                serialized_output = json.dumps(output_payload, default=str)
+            except Exception:
+                serialized_output = str(output_payload)
+        span.add_attributes(
+            {
+                'llm.output_messages.0.message.role': 'assistant',
+                'llm.output_messages.0.message.content': serialized_output,
+                'output.value': serialized_output,
+            }
+        )
+
     async def generate_response(
         self,
         messages: list[Message],
@@ -172,17 +250,32 @@ class LLMClient(ABC):
         for message in messages:
             message.content = self._clean_input(message.content)
 
+        model_name = self._resolve_traced_model_name(model_size)
+
+        invocation_parameters: dict[str, typing.Any] = {
+            'temperature': self.temperature,
+            'max_tokens': max_tokens,
+            'model_size': model_size.value,
+            'model': model_name,
+        }
+        if group_id:
+            invocation_parameters['group_id'] = group_id
+        if prompt_name:
+            invocation_parameters['prompt_name'] = prompt_name
+        if response_model is not None:
+            invocation_parameters['response_model'] = response_model.__name__
+
         # Wrap entire operation in tracing span
-        with self.tracer.start_span('llm.generate') as span:
-            attributes = {
-                'llm.provider': self._get_provider_type(),
-                'model.size': model_size.value,
-                'max_tokens': max_tokens,
-                'cache.enabled': self.cache_enabled,
-            }
-            if prompt_name:
-                attributes['prompt.name'] = prompt_name
-            span.add_attributes(attributes)
+        with self.tracer.start_span('llm') as span:
+            self._add_llm_input_attributes(
+                span,
+                messages=messages,
+                model_name=model_name,
+                model_size=model_size,
+                max_tokens=max_tokens,
+                prompt_name=prompt_name,
+                invocation_parameters=invocation_parameters,
+            )
 
             # Check cache first
             if self.cache_enabled and self.cache_dir is not None:
@@ -191,6 +284,7 @@ class LLMClient(ABC):
                 if cached_response is not None:
                     logger.debug(f'Cache hit for {cache_key}')
                     span.add_attributes({'cache.hit': True})
+                    self._record_llm_output(span, cached_response)
                     return cached_response
 
             span.add_attributes({'cache.hit': False})
@@ -210,6 +304,7 @@ class LLMClient(ABC):
                 cache_key = self._get_cache_key(messages)
                 self.cache_dir.set(cache_key, response)
 
+            self._record_llm_output(span, response)
             return response
 
     def _get_provider_type(self) -> str:

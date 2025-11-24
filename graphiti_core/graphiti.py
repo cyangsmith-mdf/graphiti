@@ -700,7 +700,15 @@ class Graphiti:
                 self.driver = self.driver.clone(database=group_id)
                 self.clients.driver = self.driver
 
+        # Wrap entire operation in tracing span, including model information for downstream observability
         with self.tracer.start_span('add_episode') as span:
+            attributes = {
+                'operation': 'add_episode',
+                'llm.provider': 'openai',
+                'llm.model_name': getattr(self.llm_client.config, 'model', 'unknown'),
+            }
+            span.add_attributes(attributes)
+
             try:
                 # Retrieve previous episodes for context
                 previous_episodes = (

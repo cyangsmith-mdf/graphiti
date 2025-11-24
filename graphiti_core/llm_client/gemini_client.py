@@ -377,16 +377,30 @@ class GeminiClient(LLMClient):
         # Add multilingual extraction instructions
         messages[0].content += get_extraction_language_instruction(group_id)
 
+        effective_max_tokens = max_tokens or self.max_tokens
+        model_name = self._resolve_traced_model_name(model_size)
+        invocation_parameters: dict[str, typing.Any] = {
+            'temperature': getattr(self, 'temperature', None),
+            'max_tokens': effective_max_tokens,
+            'model_size': model_size.value,
+            'model': model_name,
+        }
+        if response_model is not None:
+            invocation_parameters['response_model'] = response_model.__name__
+        if prompt_name:
+            invocation_parameters['prompt_name'] = prompt_name
+
         # Wrap entire operation in tracing span
-        with self.tracer.start_span('llm.generate') as span:
-            attributes = {
-                'llm.provider': 'gemini',
-                'model.size': model_size.value,
-                'max_tokens': max_tokens or self.max_tokens,
-            }
-            if prompt_name:
-                attributes['prompt.name'] = prompt_name
-            span.add_attributes(attributes)
+        with self.tracer.start_span('llm') as span:
+            self._add_llm_input_attributes(
+                span,
+                messages=messages,
+                model_name=model_name,
+                model_size=model_size,
+                max_tokens=effective_max_tokens,
+                prompt_name=prompt_name,
+                invocation_parameters=invocation_parameters,
+            )
 
             retry_count = 0
             last_error = None
@@ -405,6 +419,7 @@ class GeminiClient(LLMClient):
                         if isinstance(response, dict) and 'content' in response
                         else None
                     )
+                    self._record_llm_output(span, response)
                     return response
                 except RateLimitError as e:
                     # Rate limit errors should not trigger retries (fail fast)

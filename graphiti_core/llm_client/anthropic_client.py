@@ -358,16 +358,29 @@ class AnthropicClient(LLMClient):
         if max_tokens is None:
             max_tokens = self.max_tokens
 
+        model_name = self._resolve_traced_model_name(model_size)
+        invocation_parameters: dict[str, typing.Any] = {
+            'temperature': self.temperature,
+            'max_tokens': max_tokens,
+            'model_size': model_size.value,
+            'model': model_name,
+        }
+        if response_model is not None:
+            invocation_parameters['response_model'] = response_model.__name__
+        if prompt_name:
+            invocation_parameters['prompt_name'] = prompt_name
+
         # Wrap entire operation in tracing span
-        with self.tracer.start_span('llm.generate') as span:
-            attributes = {
-                'llm.provider': 'anthropic',
-                'model.size': model_size.value,
-                'max_tokens': max_tokens,
-            }
-            if prompt_name:
-                attributes['prompt.name'] = prompt_name
-            span.add_attributes(attributes)
+        with self.tracer.start_span('llm') as span:
+            self._add_llm_input_attributes(
+                span,
+                messages=messages,
+                model_name=model_name,
+                model_size=model_size,
+                max_tokens=max_tokens,
+                prompt_name=prompt_name,
+                invocation_parameters=invocation_parameters,
+            )
 
             retry_count = 0
             max_retries = 2
@@ -383,9 +396,12 @@ class AnthropicClient(LLMClient):
                     if response_model is not None:
                         # Validate the response against the response_model
                         model_instance = response_model(**response)
-                        return model_instance.model_dump()
+                        output_payload = model_instance.model_dump()
+                        self._record_llm_output(span, output_payload)
+                        return output_payload
 
                     # If no validation needed, return the response
+                    self._record_llm_output(span, response)
                     return response
 
                 except (RateLimitError, RefusalError):
