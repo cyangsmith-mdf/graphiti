@@ -35,6 +35,7 @@ class AzureOpenAIEmbedderClient(EmbedderClient):
         azure_client: AsyncAzureOpenAI | AsyncOpenAI,
         model: str = 'text-embedding-3-small',
     ):
+        super().__init__()
         self.azure_client = azure_client
         self.model = model
 
@@ -50,10 +51,19 @@ class AzureOpenAIEmbedderClient(EmbedderClient):
                 # Convert to string list for other types
                 text_input = [str(input_data)]
 
-            response = await self.azure_client.embeddings.create(model=self.model, input=text_input)
+            input_count = len(text_input)
+            with self._embedding_span(
+                'embedding.create',
+                input_count=input_count,
+                model_name=self.model,
+            ) as span:
+                response = await self.azure_client.embeddings.create(
+                    model=self.model, input=text_input
+                )
 
-            # Return the first embedding as a list of floats
-            return response.data[0].embedding
+                embedding = response.data[0].embedding
+                span.add_attributes({'embedding.vector_length': len(embedding)})
+                return embedding
         except Exception as e:
             logger.error(f'Error in Azure OpenAI embedding: {e}')
             raise
@@ -61,11 +71,19 @@ class AzureOpenAIEmbedderClient(EmbedderClient):
     async def create_batch(self, input_data_list: list[str]) -> list[list[float]]:
         """Create batch embeddings using Azure OpenAI client."""
         try:
-            response = await self.azure_client.embeddings.create(
-                model=self.model, input=input_data_list
-            )
+            with self._embedding_span(
+                'embedding.create_batch',
+                input_count=len(input_data_list),
+                model_name=self.model,
+            ) as span:
+                response = await self.azure_client.embeddings.create(
+                    model=self.model, input=input_data_list
+                )
 
-            return [embedding.embedding for embedding in response.data]
+                vectors = [embedding.embedding for embedding in response.data]
+                if vectors:
+                    span.add_attributes({'embedding.vector_length': len(vectors[0])})
+                return vectors
         except Exception as e:
             logger.error(f'Error in Azure OpenAI batch embedding: {e}')
             raise

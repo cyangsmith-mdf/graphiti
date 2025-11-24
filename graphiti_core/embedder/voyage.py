@@ -46,6 +46,7 @@ class VoyageAIEmbedder(EmbedderClient):
     """
 
     def __init__(self, config: VoyageAIEmbedderConfig | None = None):
+        super().__init__()
         if config is None:
             config = VoyageAIEmbedderConfig()
         self.config = config
@@ -65,12 +66,27 @@ class VoyageAIEmbedder(EmbedderClient):
         if len(input_list) == 0:
             return []
 
-        result = await self.client.embed(input_list, model=self.config.embedding_model)
-        return [float(x) for x in result.embeddings[0][: self.config.embedding_dim]]
+        with self._embedding_span(
+            'embedding.create',
+            input_count=len(input_list),
+            model_name=self.config.embedding_model,
+        ) as span:
+            result = await self.client.embed(input_list, model=self.config.embedding_model)
+            embedding = [float(x) for x in result.embeddings[0][: self.config.embedding_dim]]
+            span.add_attributes({'embedding.vector_length': len(embedding)})
+            return embedding
 
     async def create_batch(self, input_data_list: list[str]) -> list[list[float]]:
-        result = await self.client.embed(input_data_list, model=self.config.embedding_model)
-        return [
-            [float(x) for x in embedding[: self.config.embedding_dim]]
-            for embedding in result.embeddings
-        ]
+        with self._embedding_span(
+            'embedding.create_batch',
+            input_count=len(input_data_list),
+            model_name=self.config.embedding_model,
+        ) as span:
+            result = await self.client.embed(input_data_list, model=self.config.embedding_model)
+            vectors = [
+                [float(x) for x in embedding[: self.config.embedding_dim]]
+                for embedding in result.embeddings
+            ]
+            if vectors:
+                span.add_attributes({'embedding.vector_length': len(vectors[0])})
+            return vectors

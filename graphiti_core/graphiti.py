@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import contextlib
 import logging
 from datetime import datetime
 from time import time
@@ -222,6 +223,8 @@ class Graphiti:
 
         # Set tracer on clients
         self.llm_client.set_tracer(self.tracer)
+        with contextlib.suppress(AttributeError):
+            self.embedder.set_tracer(self.tracer)
 
         self.clients = GraphitiClients(
             driver=self.driver,
@@ -706,6 +709,7 @@ class Graphiti:
                 'operation': 'add_episode',
                 'llm.provider': 'openai',
                 'llm.model_name': getattr(self.llm_client.config, 'model', 'unknown'),
+                'openinference.span.kind': 'agent',
             }
             span.add_attributes(attributes)
 
@@ -816,6 +820,7 @@ class Graphiti:
                 )
 
                 logger.info(f'Completed add_episode in {(end - start) * 1000} ms')
+                span.set_status('Ok')
 
                 return AddEpisodeResults(
                     episode=episode,

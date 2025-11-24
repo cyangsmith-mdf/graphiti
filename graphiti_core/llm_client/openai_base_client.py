@@ -263,9 +263,11 @@ class BaseOpenAIClient(LLMClient):
             invocation_parameters['response_model'] = response_model.__name__
         if prompt_name:
             invocation_parameters['prompt_name'] = prompt_name
+        span_name = self._determine_span_name(prompt_name)
+        invocation_parameters['operation'] = span_name
 
         # Wrap entire operation in tracing span
-        with self.tracer.start_span('llm') as span:
+        with self.tracer.start_span(span_name, skip_prefix=True) as span:
             self._add_llm_input_attributes(
                 span,
                 messages=messages,
@@ -273,6 +275,7 @@ class BaseOpenAIClient(LLMClient):
                 model_size=model_size,
                 max_tokens=max_tokens,
                 prompt_name=prompt_name,
+                span_name=span_name,
                 invocation_parameters=invocation_parameters,
             )
 

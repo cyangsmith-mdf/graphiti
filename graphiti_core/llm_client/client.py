@@ -169,6 +169,12 @@ class LLMClient(ABC):
             attributes[f'{base_key}.content'] = message.content
         return attributes
 
+    def _determine_span_name(self, prompt_name: str | None) -> str:
+        """Derive span name based on prompt or default to llm."""
+        if prompt_name:
+            return prompt_name
+        return 'llm'
+
     def _add_llm_input_attributes(
         self,
         span: TracerSpan,
@@ -178,6 +184,7 @@ class LLMClient(ABC):
         model_size: ModelSize,
         max_tokens: int,
         prompt_name: str | None,
+        span_name: str,
         invocation_parameters: dict[str, typing.Any] | None = None,
         extra_attributes: dict[str, typing.Any] | None = None,
     ) -> None:
@@ -189,6 +196,7 @@ class LLMClient(ABC):
             'model.size': model_size.value,
             'max_tokens': max_tokens,
             'cache.enabled': self.cache_enabled,
+            'operation.name': span_name,
         }
         if model_name:
             attributes['llm.model_name'] = model_name
@@ -265,8 +273,11 @@ class LLMClient(ABC):
         if response_model is not None:
             invocation_parameters['response_model'] = response_model.__name__
 
+        span_name = self._determine_span_name(prompt_name)
+        invocation_parameters['operation'] = span_name
+
         # Wrap entire operation in tracing span
-        with self.tracer.start_span('llm') as span:
+        with self.tracer.start_span(span_name, skip_prefix=True) as span:
             self._add_llm_input_attributes(
                 span,
                 messages=messages,
@@ -274,6 +285,7 @@ class LLMClient(ABC):
                 model_size=model_size,
                 max_tokens=max_tokens,
                 prompt_name=prompt_name,
+                span_name=span_name,
                 invocation_parameters=invocation_parameters,
             )
 

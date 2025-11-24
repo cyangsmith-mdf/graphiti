@@ -42,6 +42,7 @@ class OpenAIEmbedder(EmbedderClient):
         config: OpenAIEmbedderConfig | None = None,
         client: AsyncOpenAI | AsyncAzureOpenAI | None = None,
     ):
+        super().__init__()
         if config is None:
             config = OpenAIEmbedderConfig()
         self.config = config
@@ -54,13 +55,37 @@ class OpenAIEmbedder(EmbedderClient):
     async def create(
         self, input_data: str | list[str] | Iterable[int] | Iterable[Iterable[int]]
     ) -> list[float]:
-        result = await self.client.embeddings.create(
-            input=input_data, model=self.config.embedding_model
-        )
-        return result.data[0].embedding[: self.config.embedding_dim]
+        if isinstance(input_data, list):
+            input_count: int | None = len(input_data)
+        elif isinstance(input_data, str):
+            input_count = 1
+        else:
+            input_count = None
+
+        with self._embedding_span(
+            'embedding.create',
+            input_count=input_count,
+            model_name=str(self.config.embedding_model),
+        ) as span:
+            result = await self.client.embeddings.create(
+                input=input_data, model=self.config.embedding_model
+            )
+            embedding = result.data[0].embedding[: self.config.embedding_dim]
+            span.add_attributes({'embedding.vector_length': len(embedding)})
+            return embedding
 
     async def create_batch(self, input_data_list: list[str]) -> list[list[float]]:
-        result = await self.client.embeddings.create(
-            input=input_data_list, model=self.config.embedding_model
-        )
-        return [embedding.embedding[: self.config.embedding_dim] for embedding in result.data]
+        with self._embedding_span(
+            'embedding.create_batch',
+            input_count=len(input_data_list),
+            model_name=str(self.config.embedding_model),
+        ) as span:
+            result = await self.client.embeddings.create(
+                input=input_data_list, model=self.config.embedding_model
+            )
+            vectors = [
+                embedding.embedding[: self.config.embedding_dim] for embedding in result.data
+            ]
+            if vectors:
+                span.add_attributes({'embedding.vector_length': len(vectors[0])})
+            return vectors

@@ -66,6 +66,7 @@ class GeminiEmbedder(EmbedderClient):
             client (genai.Client | None): An optional async client instance to use. If not provided, a new genai.Client is created.
             batch_size (int | None): An optional batch size to use. If not provided, the default batch size will be used.
         """
+        super().__init__()
         if config is None:
             config = GeminiEmbedderConfig()
 
@@ -98,17 +99,33 @@ class GeminiEmbedder(EmbedderClient):
         Returns:
             A list of floats representing the embedding vector.
         """
-        # Generate embeddings
-        result = await self.client.aio.models.embed_content(
-            model=self.config.embedding_model or DEFAULT_EMBEDDING_MODEL,
-            contents=[input_data],  # type: ignore[arg-type]  # mypy fails on broad union type
-            config=types.EmbedContentConfig(output_dimensionality=self.config.embedding_dim),
-        )
+        input_count: int | None
+        if isinstance(input_data, list):
+            input_count = len(input_data)
+        else:
+            input_count = 1
 
-        if not result.embeddings or len(result.embeddings) == 0 or not result.embeddings[0].values:
-            raise ValueError('No embeddings returned from Gemini API in create()')
+        with self._embedding_span(
+            'embedding.create',
+            input_count=input_count,
+            model_name=self.config.embedding_model,
+        ) as span:
+            result = await self.client.aio.models.embed_content(
+                model=self.config.embedding_model or DEFAULT_EMBEDDING_MODEL,
+                contents=[input_data],  # type: ignore[arg-type]
+                config=types.EmbedContentConfig(output_dimensionality=self.config.embedding_dim),
+            )
 
-        return result.embeddings[0].values
+            if (
+                not result.embeddings
+                or len(result.embeddings) == 0
+                or not result.embeddings[0].values
+            ):
+                raise ValueError('No embeddings returned from Gemini API in create()')
+
+            embedding = result.embeddings[0].values
+            span.add_attributes({'embedding.vector_length': len(embedding)})
+            return embedding
 
     async def create_batch(self, input_data_list: list[str]) -> list[list[float]]:
         """
@@ -127,57 +144,65 @@ class GeminiEmbedder(EmbedderClient):
             return []
 
         batch_size = self.batch_size
-        all_embeddings = []
+        all_embeddings: list[list[float]] = []
 
-        # Process inputs in batches
-        for i in range(0, len(input_data_list), batch_size):
-            batch = input_data_list[i : i + batch_size]
+        with self._embedding_span(
+            'embedding.create_batch',
+            input_count=len(input_data_list),
+            model_name=self.config.embedding_model,
+        ) as span:
+            # Process inputs in batches
+            for i in range(0, len(input_data_list), batch_size):
+                batch = input_data_list[i : i + batch_size]
 
-            try:
-                # Generate embeddings for this batch
-                result = await self.client.aio.models.embed_content(
-                    model=self.config.embedding_model or DEFAULT_EMBEDDING_MODEL,
-                    contents=batch,  # type: ignore[arg-type]  # mypy fails on broad union type
-                    config=types.EmbedContentConfig(
-                        output_dimensionality=self.config.embedding_dim
-                    ),
-                )
+                try:
+                    # Generate embeddings for this batch
+                    result = await self.client.aio.models.embed_content(
+                        model=self.config.embedding_model or DEFAULT_EMBEDDING_MODEL,
+                        contents=batch,  # type: ignore[arg-type]
+                        config=types.EmbedContentConfig(
+                            output_dimensionality=self.config.embedding_dim
+                        ),
+                    )
 
-                if not result.embeddings or len(result.embeddings) == 0:
-                    raise Exception('No embeddings returned')
+                    if not result.embeddings or len(result.embeddings) == 0:
+                        raise Exception('No embeddings returned')
 
-                # Process embeddings from this batch
-                for embedding in result.embeddings:
-                    if not embedding.values:
-                        raise ValueError('Empty embedding values returned')
-                    all_embeddings.append(embedding.values)
-
-            except Exception as e:
-                # If batch processing fails, fall back to individual processing
-                logger.warning(
-                    f'Batch embedding failed for batch {i // batch_size + 1}, falling back to individual processing: {e}'
-                )
-
-                for item in batch:
-                    try:
-                        # Process each item individually
-                        result = await self.client.aio.models.embed_content(
-                            model=self.config.embedding_model or DEFAULT_EMBEDDING_MODEL,
-                            contents=[item],  # type: ignore[arg-type]  # mypy fails on broad union type
-                            config=types.EmbedContentConfig(
-                                output_dimensionality=self.config.embedding_dim
-                            ),
-                        )
-
-                        if not result.embeddings or len(result.embeddings) == 0:
-                            raise ValueError('No embeddings returned from Gemini API')
-                        if not result.embeddings[0].values:
+                    # Process embeddings from this batch
+                    for embedding in result.embeddings:
+                        if not embedding.values:
                             raise ValueError('Empty embedding values returned')
+                        all_embeddings.append(embedding.values)
 
-                        all_embeddings.append(result.embeddings[0].values)
+                except Exception as e:
+                    # If batch processing fails, fall back to individual processing
+                    logger.warning(
+                        f'Batch embedding failed for batch {i // batch_size + 1}, falling back to individual processing: {e}'
+                    )
 
-                    except Exception as individual_error:
-                        logger.error(f'Failed to embed individual item: {individual_error}')
-                        raise individual_error
+                    for item in batch:
+                        try:
+                            # Process each item individually
+                            result = await self.client.aio.models.embed_content(
+                                model=self.config.embedding_model or DEFAULT_EMBEDDING_MODEL,
+                                contents=[item],  # type: ignore[arg-type]
+                                config=types.EmbedContentConfig(
+                                    output_dimensionality=self.config.embedding_dim
+                                ),
+                            )
 
-        return all_embeddings
+                            if not result.embeddings or len(result.embeddings) == 0:
+                                raise ValueError('No embeddings returned from Gemini API')
+                            if not result.embeddings[0].values:
+                                raise ValueError('Empty embedding values returned')
+
+                            all_embeddings.append(result.embeddings[0].values)
+
+                        except Exception as individual_error:
+                            logger.error(f'Failed to embed individual item: {individual_error}')
+                            raise individual_error
+
+            if all_embeddings:
+                span.add_attributes({'embedding.vector_length': len(all_embeddings[0])})
+
+            return all_embeddings

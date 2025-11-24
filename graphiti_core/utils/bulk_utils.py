@@ -17,17 +17,16 @@ limitations under the License.
 import json
 import logging
 import typing
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from datetime import datetime
+from time import perf_counter
 
 import numpy as np
 from pydantic import BaseModel, Field
 from typing_extensions import Any
 
-from graphiti_core.driver.driver import (
-    GraphDriver,
-    GraphDriverSession,
-    GraphProvider,
-)
+from graphiti_core.driver.driver import GraphDriver, GraphDriverSession, GraphProvider
 from graphiti_core.edges import Edge, EntityEdge, EpisodicEdge, create_entity_edge_embeddings
 from graphiti_core.embedder import EmbedderClient
 from graphiti_core.graphiti_types import GraphitiClients
@@ -64,6 +63,73 @@ from graphiti_core.utils.maintenance.node_operations import (
 logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 10
+
+try:
+    from opentelemetry import trace as otel_trace
+except ImportError:
+    otel_trace = None
+
+
+def _emit_db_event(
+    driver: GraphDriver, event_name: str, attributes: dict[str, Any] | None = None
+) -> None:
+    """Record an OpenTelemetry event for database operations when tracing is enabled."""
+    if otel_trace is None:
+        return
+
+    span = otel_trace.get_current_span()
+    if span is None:
+        return
+
+    add_event = getattr(span, 'add_event', None) or getattr(span, 'addEvent', None)
+    if add_event is None:
+        return
+
+    event_attrs = {'graph.provider': driver.provider.value}
+    if attributes:
+        event_attrs.update(attributes)
+
+    with suppress(Exception):
+        add_event(event_name, event_attrs)
+
+
+async def _run_with_db_event(
+    driver: GraphDriver,
+    event_suffix: str,
+    operation: Callable[[], Awaitable[Any]],
+    attributes: dict[str, Any] | None = None,
+):
+    """Execute an async operation while emitting database tracing events."""
+    base_attrs = {
+        'db.event': event_suffix,
+        'graph.provider': driver.provider.value,
+        'log.severity': 'info',
+    }
+    if attributes:
+        base_attrs.update(attributes)
+
+    event_prefix = f'db.{event_suffix}'
+    start = perf_counter()
+    _emit_db_event(driver, f'{event_prefix}.start', base_attrs)
+
+    try:
+        result = await operation()
+    except Exception as exc:
+        error_attrs = dict(base_attrs)
+        error_attrs.update(
+            {
+                'log.severity': 'error',
+                'log.message': str(exc),
+                'exception.type': exc.__class__.__name__,
+            }
+        )
+        _emit_db_event(driver, f'{event_prefix}.error', error_attrs)
+        raise
+    else:
+        success_attrs = dict(base_attrs)
+        success_attrs['duration_ms'] = (perf_counter() - start) * 1000
+        _emit_db_event(driver, f'{event_prefix}.success', success_attrs)
+        return result
 
 
 def _build_directed_uuid_map(pairs: list[tuple[str, str]]) -> dict[str, str]:
@@ -135,14 +201,25 @@ async def add_nodes_and_edges_bulk(
 ):
     session = driver.session()
     try:
-        await session.execute_write(
-            add_nodes_and_edges_bulk_tx,
-            episodic_nodes,
-            episodic_edges,
-            entity_nodes,
-            entity_edges,
-            embedder,
-            driver=driver,
+        payload_counts = {
+            'episodic_node.count': len(episodic_nodes),
+            'episodic_edge.count': len(episodic_edges),
+            'entity_node.count': len(entity_nodes),
+            'entity_edge.count': len(entity_edges),
+        }
+        await _run_with_db_event(
+            driver,
+            'execute_write',
+            lambda: session.execute_write(
+                add_nodes_and_edges_bulk_tx,
+                episodic_nodes,
+                episodic_edges,
+                entity_nodes,
+                entity_edges,
+                embedder,
+                driver=driver,
+            ),
+            payload_counts,
         )
     finally:
         await session.close()
@@ -214,12 +291,34 @@ async def add_nodes_and_edges_bulk_tx(
         edges.append(edge_data)
 
     if driver.graph_operations_interface:
-        await driver.graph_operations_interface.episodic_node_save_bulk(None, driver, tx, episodes)
-        await driver.graph_operations_interface.node_save_bulk(None, driver, tx, nodes)
-        await driver.graph_operations_interface.episodic_edge_save_bulk(
-            None, driver, tx, [edge.model_dump() for edge in episodic_edges]
+        await _run_with_db_event(
+            driver,
+            'graph_ops.episodic_node_save_bulk',
+            lambda: driver.graph_operations_interface.episodic_node_save_bulk(
+                None, driver, tx, episodes
+            ),
+            {'episodic_node.count': len(episodes)},
         )
-        await driver.graph_operations_interface.edge_save_bulk(None, driver, tx, edges)
+        await _run_with_db_event(
+            driver,
+            'graph_ops.entity_node_save_bulk',
+            lambda: driver.graph_operations_interface.node_save_bulk(None, driver, tx, nodes),
+            {'entity_node.count': len(nodes)},
+        )
+        await _run_with_db_event(
+            driver,
+            'graph_ops.episodic_edge_save_bulk',
+            lambda: driver.graph_operations_interface.episodic_edge_save_bulk(
+                None, driver, tx, [edge.model_dump() for edge in episodic_edges]
+            ),
+            {'episodic_edge.count': len(episodic_edges)},
+        )
+        await _run_with_db_event(
+            driver,
+            'graph_ops.entity_edge_save_bulk',
+            lambda: driver.graph_operations_interface.edge_save_bulk(None, driver, tx, edges),
+            {'entity_edge.count': len(edges)},
+        )
 
     elif driver.provider == GraphProvider.KUZU:
         # FIXME: Kuzu's UNWIND does not currently support STRUCT[] type properly, so we insert the data one by one instead for now.
@@ -236,18 +335,35 @@ async def add_nodes_and_edges_bulk_tx(
         for edge in episodic_edges:
             await tx.run(episodic_edge_query, **edge.model_dump())
     else:
-        await tx.run(get_episode_node_save_bulk_query(driver.provider), episodes=episodes)
-        await tx.run(
-            get_entity_node_save_bulk_query(driver.provider, nodes),
-            nodes=nodes,
+        await _run_with_db_event(
+            driver,
+            'tx.episodic_nodes',
+            lambda: tx.run(get_episode_node_save_bulk_query(driver.provider), episodes=episodes),
+            {'episodic_node.count': len(episodes)},
         )
-        await tx.run(
-            get_episodic_edge_save_bulk_query(driver.provider),
-            episodic_edges=[edge.model_dump() for edge in episodic_edges],
+        await _run_with_db_event(
+            driver,
+            'tx.entity_nodes',
+            lambda: tx.run(get_entity_node_save_bulk_query(driver.provider, nodes), nodes=nodes),
+            {'entity_node.count': len(nodes)},
         )
-        await tx.run(
-            get_entity_edge_save_bulk_query(driver.provider),
-            entity_edges=edges,
+        await _run_with_db_event(
+            driver,
+            'tx.episodic_edges',
+            lambda: tx.run(
+                get_episodic_edge_save_bulk_query(driver.provider),
+                episodic_edges=[edge.model_dump() for edge in episodic_edges],
+            ),
+            {'episodic_edge.count': len(episodic_edges)},
+        )
+        await _run_with_db_event(
+            driver,
+            'tx.entity_edges',
+            lambda: tx.run(
+                get_entity_edge_save_bulk_query(driver.provider),
+                entity_edges=edges,
+            ),
+            {'entity_edge.count': len(edges)},
         )
 
 

@@ -53,7 +53,7 @@ class Tracer(ABC):
     """Abstract base class for tracers."""
 
     @abstractmethod
-    def start_span(self, name: str) -> AbstractContextManager[TracerSpan]:
+    def start_span(self, name: str, skip_prefix: bool = False) -> AbstractContextManager[TracerSpan]:
         """Start a new span with the given name."""
         pass
 
@@ -75,7 +75,7 @@ class NoOpTracer(Tracer):
     """No-op tracer implementation that does nothing."""
 
     @contextmanager
-    def start_span(self, name: str) -> Generator[NoOpSpan, None, None]:
+    def start_span(self, name: str, skip_prefix: bool = False) -> Generator[NoOpSpan, None, None]:
         """Return a no-op span."""
         yield NoOpSpan()
 
@@ -109,9 +109,10 @@ class OpenTelemetrySpan(TracerSpan):
         """Set the status of the OpenTelemetry span."""
         try:
             if OTEL_AVAILABLE:
-                if status == 'error':
+                normalized = status.strip().lower()
+                if normalized == 'error':
                     self._span.set_status(StatusCode.ERROR, description)
-                elif status == 'ok':
+                elif normalized == 'ok':
                     self._span.set_status(StatusCode.OK, description)
         except Exception:
             # Silently ignore tracing errors
@@ -144,22 +145,45 @@ class OpenTelemetryTracer(Tracer):
         self._tracer = tracer
         self._span_prefix = span_prefix.rstrip('.')
 
-    @contextmanager
-    def start_span(self, name: str) -> Generator[OpenTelemetrySpan | NoOpSpan, None, None]:
+    def start_span(self, name: str, skip_prefix: bool = False) -> AbstractContextManager[TracerSpan]:
         """Start a new OpenTelemetry span with the configured prefix."""
+        if skip_prefix or not self._span_prefix:
+            full_name = name
+        else:
+            full_name = f'{self._span_prefix}.{name}'
+
+        return _OpenTelemetrySpanContext(self._tracer, full_name)
+
+
+class _OpenTelemetrySpanContext(AbstractContextManager[TracerSpan]):
+    """Context manager that wraps the OpenTelemetry span lifecycle safely."""
+
+    def __init__(self, tracer: Any, span_name: str):
+        self._tracer = tracer
+        self._span_name = span_name
+        self._cm: AbstractContextManager['Span'] | None = None
+        self._span_wrapper: TracerSpan = NoOpSpan()
+
+    def __enter__(self) -> TracerSpan:
         try:
-            # Phoenix expects raw "llm" span names to remain un-prefixed for LLM traces.
-            if name == 'llm':
-                full_name = 'llm'
-            elif self._span_prefix:
-                full_name = f'{self._span_prefix}.{name}'
-            else:
-                full_name = name
-            with self._tracer.start_as_current_span(full_name) as span:
-                yield OpenTelemetrySpan(span)
+            self._cm = self._tracer.start_as_current_span(self._span_name)
+            span = self._cm.__enter__()
         except Exception:
-            # If tracing fails, yield a no-op span to prevent breaking the operation
-            yield NoOpSpan()
+            self._cm = None
+            self._span_wrapper = NoOpSpan()
+            return self._span_wrapper
+
+        self._span_wrapper = OpenTelemetrySpan(span)
+        return self._span_wrapper
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if self._cm is None:
+            return False
+
+        with suppress(Exception):
+            return bool(self._cm.__exit__(exc_type, exc, tb))
+
+        return False
 
 
 def create_tracer(otel_tracer: Any | None = None, span_prefix: str = 'graphiti') -> Tracer:
